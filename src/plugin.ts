@@ -130,9 +130,10 @@ export class TsconfigPathsPlugin implements ResolverPlugin {
   target: string;
 
   log: Logger.Logger;
-  baseUrl: string;
   absoluteBaseUrl: string;
   extensions: ReadonlyArray<string>;
+
+  options: Options.Options;
 
   matchPath: TsconfigPaths.MatchPathAsync;
 
@@ -140,48 +141,15 @@ export class TsconfigPathsPlugin implements ResolverPlugin {
     this.source = "described-resolve";
     this.target = "resolve";
 
-    const options = Options.getOptions(rawOptions);
+    const options = (this.options = Options.getOptions(rawOptions));
 
     this.extensions = options.extensions;
 
     const colors = new chalk.constructor({ enabled: options.colors });
     this.log = Logger.makeLogger(options, colors);
-
-    const context = options.context || process.cwd();
-    const loadFrom = options.configFile || context;
-
-    const loadResult = TsconfigPaths.loadConfig(loadFrom);
-    if (loadResult.resultType === "failed") {
-      this.log.logError(`Failed to load ${loadFrom}: ${loadResult.message}`);
-    } else {
-      this.log.logInfo(
-        `tsconfig-paths-webpack-plugin: Using config file at ${
-          loadResult.configFileAbsolutePath
-        }`
-      );
-      this.baseUrl = options.baseUrl || loadResult.baseUrl;
-      this.absoluteBaseUrl = options.baseUrl
-        ? path.resolve(options.baseUrl)
-        : loadResult.absoluteBaseUrl;
-      this.matchPath = TsconfigPaths.createMatchPathAsync(
-        this.absoluteBaseUrl,
-        loadResult.paths,
-        options.mainFields
-      );
-    }
   }
 
   apply(resolver: Resolver): void {
-    const { baseUrl } = this;
-
-    if (!baseUrl) {
-      // Nothing to do if there is no baseUrl
-      this.log.logWarning(
-        "tsconfig-paths-webpack-plugin: Found no baseUrl in tsconfig.json, not applying tsconfig-paths-webpack-plugin"
-      );
-      return;
-    }
-
     // The file system only exists when the plugin is in the resolve context. This means it's also properly placed in the resolve.plugins array.
     // If not, we should warn the user that this plugin should be placed in resolve.plugins and not the plugins array of the root config for example.
     // This should hopefully prevent issues like: https://github.com/dividab/tsconfig-paths-webpack-plugin/issues/9
@@ -200,12 +168,10 @@ export class TsconfigPathsPlugin implements ResolverPlugin {
         .getHook(this.source)
         .tapAsync(
           { name: "TsconfigPathsPlugin" },
-          createPluginCallback(
-            this.matchPath,
+          createPluginCallback.call(
+            this,
             resolver,
-            this.absoluteBaseUrl,
-            resolver.getHook(this.target),
-            this.extensions
+            resolver.getHook(this.target)
           )
         );
     } else {
@@ -225,11 +191,9 @@ export class TsconfigPathsPlugin implements ResolverPlugin {
 }
 
 function createPluginCallback(
-  matchPath: TsconfigPaths.MatchPathAsync,
+  this: TsconfigPathsPlugin,
   resolver: Resolver,
-  absoluteBaseUrl: string,
-  hook: Tapable,
-  extensions: ReadonlyArray<string>
+  hook: Tapable
 ): ResolverCallback {
   const fileExistAsync = createFileExistAsync(resolver.fileSystem);
   const readJsonAsync = createReadJsonAsync(resolver.fileSystem);
@@ -242,16 +206,33 @@ function createPluginCallback(
 
     if (
       !innerRequest ||
-      (innerRequest.startsWith(".") || innerRequest.startsWith(".."))
+      innerRequest.startsWith(".") || innerRequest.startsWith("..")
     ) {
       return callback();
     }
+
+    const loadResult = TsconfigPaths.loadConfig(request.path);
+    if (loadResult.resultType === "failed") {
+      let message = `Failed to load tsconfig.json: ${loadResult.message}`;
+      this.log.logError(message);
+      return callback(new Error(message));
+    }
+
+    const baseUrl = this.options.baseUrl || loadResult.baseUrl;
+    const absoluteBaseUrl = this.options.baseUrl
+      ? path.resolve(baseUrl)
+      : loadResult.absoluteBaseUrl;
+    const matchPath = TsconfigPaths.createMatchPathAsync(
+      absoluteBaseUrl,
+      loadResult.paths,
+      this.options.mainFields
+    );
 
     matchPath(
       innerRequest,
       readJsonAsync,
       fileExistAsync,
-      extensions,
+      this.extensions,
       (err, foundMatch) => {
         if (err) {
           return callback(err);
@@ -264,7 +245,7 @@ function createPluginCallback(
         const newRequest = {
           ...request,
           request: foundMatch,
-          path: absoluteBaseUrl
+          path: path.dirname(foundMatch)
         };
 
         // Only at this point we are sure we are dealing with the latest Webpack version (>= 4.0.0)
@@ -311,7 +292,7 @@ function createPluginLegacy(
 
     if (
       !innerRequest ||
-      (innerRequest.startsWith(".") || innerRequest.startsWith(".."))
+      innerRequest.startsWith(".") || innerRequest.startsWith("..")
     ) {
       return callback();
     }
